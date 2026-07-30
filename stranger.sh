@@ -62,12 +62,42 @@ cd "$WORK" || exit 1
 #         Both are read from the repo, because the claim is half of every check
 #         below. Without it this is a download test, and download tests pass on
 #         tools nobody can install.
+# Fetch by STATUS, not by emptiness. raw.githubusercontent returns the string
+# "404: Not Found" as a 14-byte BODY, so a non-empty check treats it as a README
+# — and because that made $README non-empty, the master fallback never ran. Every
+# master-branch repo was then audited against a document containing no claims, no
+# URLs and no install script, which reported them as having undocumented assets.
+# Seven false alarms in the first scheduled run, and false alarms are how a check
+# gets muted.
+fetch_readme() {
+  BODY=$(curl -sSL -m 25 -w '\n%{http_code}' "$1" 2>/dev/null)
+  CODE=$(printf '%s' "$BODY" | tail -1)
+  [ "$CODE" = "200" ] || return 1
+  printf '%s' "$BODY" | sed '$d'
+}
 README=""
-[ -n "$REPO_DIR" ] && [ -f "$REPO_DIR/README.md" ] && README=$(cat "$REPO_DIR/README.md")
-[ -z "$README" ] && README=$(curl -s -m 25 "https://raw.githubusercontent.com/$REPO/main/README.md" 2>/dev/null)
-[ -z "$README" ] && README=$(curl -s -m 25 "https://raw.githubusercontent.com/$REPO/master/README.md" 2>/dev/null)
-[ -n "$README" ] && check "the README is reachable (a stranger reads this first)" 1 \
-  || check "no README could be found for $REPO" 0
+BRANCH=""
+if [ -n "$REPO_DIR" ] && [ -f "$REPO_DIR/README.md" ]; then
+  README=$(cat "$REPO_DIR/README.md"); BRANCH="local"
+fi
+if [ -z "$README" ]; then
+  for b in main master; do
+    if README=$(fetch_readme "https://raw.githubusercontent.com/$REPO/$b/README.md"); then BRANCH="$b"; break; fi
+    README=""
+  done
+fi
+if [ -n "$README" ]; then
+  check "the README is reachable ($BRANCH) — a stranger reads this first" 1
+else
+  # A repo this checker cannot SEE is not a repo that is broken. Private (or
+  # renamed) repos returned 404 on both branches and were reported as failures,
+  # which put hart and crm-cli — both private — into a Telegram alert. A checker
+  # that cries wolf about things it cannot inspect gets muted.
+  echo "  skip $REPO is not publicly readable (private, renamed, or no README on main/master) — not judged"
+  echo "{\"ok\":true,\"repo\":\"$REPO\",\"failures\":0,\"warnings\":0,\"notes\":\"not-public\"}"
+  [ "$KEEP" = "0" ] && rm -rf "$WORK"
+  exit 0
+fi
 
 CLAIMS_STATIC=0
 echo "$README" | grep -qiE 'static(ally)?[- ](linked|binary)|single static binary|one static binary' && CLAIMS_STATIC=1
@@ -87,12 +117,34 @@ else
 fi
 
 # ---- 1. is there anything to install at all?
-PUBLISHED=$(curl -s -m 25 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
-            | python3 -c 'import json,sys
+# Distinguish "no releases" from "GitHub would not tell us". Unauthenticated
+# api.github.com allows 60 requests an hour, and a rate-limited reply parsed as
+# "no assets" turns a healthy repo into a failure report.
+# A token raises the limit from 60/hour to 5000 and is optional: the checker must
+# work for anyone auditing a repo they do not own.
+GH_AUTH=""
+[ -n "${GITHUB_TOKEN:-}" ] && GH_AUTH="Authorization: Bearer $GITHUB_TOKEN"
+[ -z "$GH_AUTH" ] && [ -n "${GH_TOKEN:-}" ] && GH_AUTH="Authorization: Bearer $GH_TOKEN"
+if [ -n "$GH_AUTH" ]; then
+  API=$(curl -s -m 25 -H "$GH_AUTH" "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)
+else
+  API=$(curl -s -m 25 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null)
+fi
+PUBLISHED=$(printf '%s' "$API" | python3 -c 'import json,sys
 try:
-    d=json.load(sys.stdin)
-    print(" ".join(a["name"] for a in d.get("assets",[])))
-except Exception: print("")' 2>/dev/null)
+    d = json.load(sys.stdin)
+    if isinstance(d, dict) and "rate limit" in (d.get("message") or "").lower():
+        print("__RATELIMIT__")
+    else:
+        print(" ".join(a["name"] for a in d.get("assets", [])))
+except Exception:
+    print("")' 2>/dev/null)
+if [ "$PUBLISHED" = "__RATELIMIT__" ]; then
+  warn "GitHub API rate-limited — cannot tell whether releases exist; not judging this repo"
+  echo "{\"ok\":true,\"repo\":\"$REPO\",\"failures\":$fails,\"warnings\":$warns,\"notes\":\"rate-limited\"}"
+  [ "$KEEP" = "0" ] && rm -rf "$WORK"
+  exit 0
+fi
 
 # An install SCRIPT is a documented install path too. The first version of this
 # checker reported machin-terminal as having undocumented assets, when its README
