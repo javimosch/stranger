@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# stranger — does your published tool work for someone who has none of your context?
+#
+# Every project's own test suite builds from source, in the repository, on a
+# machine with the toolchain installed. None of that describes the person who
+# found your README. They have a URL, a shell, and no reason to debug you.
+#
+# This walks that path instead: it fetches the PUBLISHED artifact into an empty
+# directory with no repository, no toolchain, and a throwaway HOME, then checks
+# that it runs and that it is what the README says it is.
+#
+# It was written after grange's documented install command turned out to have
+# never worked — it pointed at an asset name no release had ever published, so
+# `curl` wrote 9 bytes of "Not Found", `chmod +x` accepted it, and the tool
+# answered "Not: command not found". Release downloads across every version:
+# zero. A funnel with no users is also a funnel with no bug reports, so nothing
+# was ever going to report it. The same sweep then found two SHIPPED tools whose
+# READMEs promised "one static binary" while publishing dynamically linked ones
+# that could not start on Debian 11, Ubuntu 20.04, RHEL 8 or Alpine.
+#
+# The checks that matter are the ones comparing the artifact to the CLAIM. A
+# dynamically linked binary is not a bug; a dynamically linked binary under a
+# paragraph promising no runtime dependencies is.
+#
+#   ./stranger.sh javimosch/grange
+#   ./stranger.sh javimosch/vigie --asset vigie --repo-dir ~/ai/vigie
+#   ./stranger.sh javimosch/roam --verb version
+set -u
+
+REPO=""
+ASSET=""
+REPO_DIR=""
+VERB=""
+KEEP=0
+TAG="latest"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --asset)    ASSET="$2"; shift 2 ;;
+    --repo-dir) REPO_DIR="$2"; shift 2 ;;
+    --verb)     VERB="$2"; shift 2 ;;
+    --tag)      TAG="$2"; shift 2 ;;
+    --keep)     KEEP=1; shift ;;
+    -*)         echo "{\"ok\":false,\"error\":\"unknown option: $1\"}"; exit 64 ;;
+    *)          REPO="$1"; shift ;;
+  esac
+done
+[ -n "$REPO" ] || { echo '{"ok":false,"error":"usage: stranger.sh <owner/repo> [--asset NAME] [--repo-dir DIR] [--verb V]"}'; exit 64; }
+
+NAME=$(basename "$REPO")
+fails=0
+warns=0
+notes=""
+check() { if [ "$2" = "1" ]; then echo "  ok   $1"; else echo "  FAIL $1"; fails=$((fails + 1)); fi; }
+warn()  { echo "  warn $1"; warns=$((warns + 1)); }
+skip()  { echo "  skip $1"; }
+
+WORK=$(mktemp -d "/tmp/stranger-$NAME-XXXX")
+export HOME="$WORK/home"; mkdir -p "$HOME"
+cd "$WORK" || exit 1
+
+# ---- 0. what does the README tell a stranger to do, and what does it promise?
+#         Both are read from the repo, because the claim is half of every check
+#         below. Without it this is a download test, and download tests pass on
+#         tools nobody can install.
+README=""
+[ -n "$REPO_DIR" ] && [ -f "$REPO_DIR/README.md" ] && README=$(cat "$REPO_DIR/README.md")
+[ -z "$README" ] && README=$(curl -s -m 25 "https://raw.githubusercontent.com/$REPO/main/README.md" 2>/dev/null)
+[ -z "$README" ] && README=$(curl -s -m 25 "https://raw.githubusercontent.com/$REPO/master/README.md" 2>/dev/null)
+[ -n "$README" ] && check "the README is reachable (a stranger reads this first)" 1 \
+  || check "no README could be found for $REPO" 0
+
+CLAIMS_STATIC=0
+echo "$README" | grep -qiE 'static(ally)?[- ](linked|binary)|single static binary|one static binary' && CLAIMS_STATIC=1
+CLAIMS_NO_DEPS=0
+echo "$README" | grep -qiE 'no (runtime )?dependencies|no glibc floor|zero dependencies|no Docker required' && CLAIMS_NO_DEPS=1
+
+# the documented URL, exactly as printed — not one reconstructed from the API,
+# because the whole point is whether what is WRITTEN DOWN works
+DOC_URL=$(echo "$README" | grep -ohE 'https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/releases/(latest/download|download/[^/ ]+)/[A-Za-z0-9._-]+' | head -1)
+if [ -n "$ASSET" ]; then
+  URL="https://github.com/$REPO/releases/latest/download/$ASSET"
+  [ "$TAG" != "latest" ] && URL="https://github.com/$REPO/releases/download/$TAG/$ASSET"
+elif [ -n "$DOC_URL" ]; then
+  URL="$DOC_URL"
+else
+  URL=""
+fi
+
+# ---- 1. is there anything to install at all?
+PUBLISHED=$(curl -s -m 25 "https://api.github.com/repos/$REPO/releases/latest" 2>/dev/null \
+            | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin)
+    print(" ".join(a["name"] for a in d.get("assets",[])))
+except Exception: print("")' 2>/dev/null)
+
+# An install SCRIPT is a documented install path too. The first version of this
+# checker reported machin-terminal as having undocumented assets, when its README
+# opens with `curl .../install.sh | bash` — a false positive, and the kind that
+# would have had me "fixing" a README that was already correct.
+INSTALL_SH=$(echo "$README" | grep -ohE 'https://raw\.githubusercontent\.com/[A-Za-z0-9_./-]+install[A-Za-z0-9_.-]*\.sh|https://[A-Za-z0-9_./-]+/install\.sh' | head -1)
+if [ -z "$URL" ] && [ -n "$INSTALL_SH" ]; then
+  SH_CODE=$(curl -sSL -o sh.txt -w '%{http_code}' -m 30 "$INSTALL_SH" 2>/dev/null)
+  if [ "$SH_CODE" = "200" ] && [ -s sh.txt ]; then
+    check "the documented install script resolves ($INSTALL_SH)" 1
+    # it must reference a real release asset, or it will fail the same way a bad
+    # URL does — just one level deeper, where nobody looks
+    SH_ASSET=$(grep -ohE '[A-Za-z0-9_.-]+-(linux|darwin)[A-Za-z0-9_.-]*|releases/latest/download/[A-Za-z0-9._-]+' sh.txt | head -1 | sed 's|.*/||')
+    if [ -n "$SH_ASSET" ] && echo "$PUBLISHED" | grep -q "$SH_ASSET"; then
+      check "the install script points at a published asset ($SH_ASSET)" 1
+    elif [ -n "$PUBLISHED" ]; then
+      warn "could not confirm the install script's asset against published: $PUBLISHED"
+    fi
+    notes="$notes install-script"
+  else
+    check "the documented install script returns http $SH_CODE — the only install path is broken" 0
+  fi
+  echo "{\"ok\":$([ "$fails" = "0" ] && echo true || echo false),\"repo\":\"$REPO\",\"failures\":$fails,\"warnings\":$warns,\"notes\":\"${notes# }\"}"
+  [ "$KEEP" = "0" ] && rm -rf "$WORK"
+  exit $([ "$fails" = "0" ] && echo 0 || echo 1)
+fi
+
+if [ -z "$URL" ]; then
+  if [ -n "$PUBLISHED" ]; then
+    check "the README documents no download, but releases publish: $PUBLISHED" 0
+    notes="$notes undocumented-assets"
+  else
+    # No artifact and no documented download. That is a legitimate choice —
+    # build-from-source — but ONLY if the README says so. A README that promises
+    # "one static binary" and offers nothing to download is the worse failure,
+    # because the reader believes a binary exists.
+    # "static binary" + no artifact is only a LIE when there is also no way to
+    # get one. Where the README documents building from source, the claim
+    # describes the build output and is true — bossless says "no public instance
+    # and none is planned. Clone it, build it, own your own", and the first
+    # version of this check called that a broken promise. A tool that flags
+    # honest projects teaches you to ignore it.
+    BUILDS_FROM_SOURCE=0
+    echo "$README" | grep -qE '\./build\.sh|make build|go install|cargo install|git clone' && BUILDS_FROM_SOURCE=1
+    if [ "$CLAIMS_STATIC" = "1" ] && [ "$BUILDS_FROM_SOURCE" = "0" ]; then
+      check "the README promises a static binary, publishes NO artifact, and documents no way to build one" 0
+      notes="$notes no-install-path"
+    elif [ "$CLAIMS_STATIC" = "1" ]; then
+      warn "no published artifact — 'static binary' describes the build output, and building is documented. A release would still save every reader a toolchain"
+      notes="$notes source-only-by-design"
+    else
+      warn "no published artifact and none documented — build-from-source only"
+      notes="$notes source-only"
+    fi
+  fi
+  echo "{\"ok\":$([ "$fails" = "0" ] && echo true || echo false),\"repo\":\"$REPO\",\"failures\":$fails,\"warnings\":$warns,\"notes\":\"${notes# }\"}"
+  [ "$KEEP" = "0" ] && rm -rf "$WORK"
+  exit $([ "$fails" = "0" ] && echo 0 || echo 1)
+fi
+
+# ---- 2. the documented command, run verbatim
+HTTP=$(curl -sSL -o bin -w '%{http_code}' -m 90 "$URL" 2>/dev/null)
+[ "$HTTP" = "200" ] && check "the documented download URL resolves (http $HTTP)" 1 \
+  || check "the documented download URL returns http $HTTP — a stranger gets nothing: $URL" 0
+SIZE=$(wc -c < bin 2>/dev/null || echo 0)
+[ "$SIZE" -gt 50000 ] 2>/dev/null && check "the download is a plausible binary ($SIZE bytes)" 1 \
+  || check "the download is $SIZE bytes — an error page, not a binary" 0
+chmod +x bin 2>/dev/null
+
+# ---- 3. it must RUN with none of the author's machine around it
+RUNS=0
+if [ -x ./bin ] && ./bin --help >/dev/null 2>&1 || ./bin help >/dev/null 2>&1 || ./bin version >/dev/null 2>&1 || ./bin guide >/dev/null 2>&1; then
+  RUNS=1
+  check "the artifact executes here (no toolchain, no repo, empty HOME)" 1
+else
+  ERR=$(./bin --help 2>&1 | head -c 100)
+  check "the artifact does not execute: $ERR" 0
+fi
+
+# ---- 4. artifact vs claim. These are gated on RUNS because they LIE on a
+#         non-binary: ldd reports "not a dynamic executable" for a text file and
+#         objdump finds no GLIBC symbols in one, so a 404 error page scores
+#         "static, as promised".
+if [ "$RUNS" = "0" ]; then
+  [ "$CLAIMS_STATIC" = "1" ] && check "linkage cannot be assessed: the download is not runnable" 0
+else
+  LIBS=$(ldd ./bin 2>&1 | grep -oE 'lib[a-z0-9_]+\.so[^ ]*' | sort -u | tr '\n' ' ')
+  STATIC=0
+  ldd ./bin 2>&1 | grep -q "not a dynamic executable" && STATIC=1
+  FLOOR=$(objdump -T ./bin 2>/dev/null | grep -oE 'GLIBC_[0-9.]+' | sort -uV | tail -1)
+
+  if [ "$CLAIMS_STATIC" = "1" ] || [ "$CLAIMS_NO_DEPS" = "1" ]; then
+    if [ "$STATIC" = "1" ]; then
+      check "the README promises static, and the published binary is static" 1
+    else
+      check "the README promises a STATIC binary but the release links: $LIBS" 0
+      notes="$notes false-static-claim"
+    fi
+    if [ -z "$FLOOR" ]; then
+      check "no glibc floor, as promised" 1
+    else
+      # this is the concrete consequence, so name the distros rather than the symbol
+      check "the README promises no glibc floor but the release needs $FLOOR — will not start on Debian 11, Ubuntu 20.04, RHEL 8, Alpine" 0
+      notes="$notes glibc-floor"
+    fi
+  else
+    [ "$STATIC" = "1" ] && echo "  ok   static binary (not claimed, but true)" \
+      || warn "dynamically linked (${FLOOR:-no floor}): $LIBS — not claimed static, so not a broken promise, but it limits where it runs"
+  fi
+fi
+
+# ---- 5. the agent-first contract (cli-guide-spec / cli-output-spec). A tool
+#         that advertises these must honour them from a cold artifact, which is
+#         the only place it matters.
+if [ "$RUNS" = "1" ]; then
+  # A mistyped verb must FAIL. Checked before anything else, because if a tool
+  # exits 0 on nonsense then every "does this verb exist?" probe below is
+  # meaningless — that is how this checker came to report "guide runs but is not
+  # valid JSON" about a tool with no guide verb at all.
+  ./bin zzz-not-a-real-verb >/dev/null 2>&1
+  BADRC=$?
+  BADOUT=$(./bin zzz-not-a-real-verb 2>&1 | head -c 200)
+  if [ "$BADRC" = "0" ]; then
+    check "a mistyped verb exits 0 — an agent cannot tell a typo from success (cli-output-spec: 80-89)" 0
+    notes="$notes zero-exit-on-typo"
+    VERB_PROBE_OK=0
+  else
+    check "a mistyped verb exits non-zero ($BADRC), so a typo is detectable" 1
+    VERB_PROBE_OK=1
+  fi
+
+  # has_verb: exit 0 AND output that does not say "unknown command"
+  has_verb() {
+    ./bin "$1" >/dev/null 2>&1 || return 1
+    [ "$VERB_PROBE_OK" = "1" ] && return 0
+    ./bin "$1" 2>&1 | grep -qiE "unknown (command|verb)|usage:" && return 1
+    return 0
+  }
+
+  if has_verb guide; then
+    ./bin guide 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null \
+      && check "guide is valid JSON, so an agent can drive it cold" 1 \
+      || check "guide runs but is not valid JSON" 0
+  else
+    echo "$README" | grep -q "guide" && warn "the README mentions a guide but \`$NAME guide\` does not run" \
+      || skip "no guide verb (cli-guide-spec not adopted)"
+  fi
+  if has_verb help-json; then
+    ./bin help-json 2>/dev/null | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null \
+      && check "help-json is a machine-readable catalog" 1 || check "help-json is not valid JSON" 0
+  else
+    skip "no help-json verb"
+  fi
+  # stdout discipline on whatever verb we can safely run
+  V="${VERB:-version}"
+  if OUT=$(./bin "$V" 2>/dev/null) && [ -n "$OUT" ]; then
+    if echo "$OUT" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+      check "\`$NAME $V\` puts parseable JSON on stdout" 1
+    else
+      warn "\`$NAME $V\` prints non-JSON on stdout (fine for a human verb, not for a data one)"
+    fi
+  fi
+fi
+
+cd /
+[ "$KEEP" = "1" ] && echo "  kept: $WORK" || rm -rf "$WORK"
+
+echo "{\"ok\":$([ "$fails" = "0" ] && echo true || echo false),\"repo\":\"$REPO\",\"failures\":$fails,\"warnings\":$warns,\"notes\":\"${notes# }\"}"
+[ "$fails" = "0" ] || exit 1
+exit 0
