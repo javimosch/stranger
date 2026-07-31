@@ -97,6 +97,29 @@ except Exception:
   esac
 done
 
+# The LIVE services are a second surface with its own failure mode: an artifact
+# can be perfect while the running service contradicts the contract an agent
+# reads to drive it. Same debounce, same alert.
+CONTRACT_OUT=""
+if [ -x "$HERE/contract.sh" ]; then
+  CONTRACT_OUT=$("$HERE/contract.sh" 2>/dev/null | tail -1)
+  CBROKE=$(printf '%s' "$CONTRACT_OUT" | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("broke",""))
+except Exception: print("")' 2>/dev/null)
+  CWAS=$(echo "$PREV" | grep "^__contract=" | head -1 | cut -d= -f2-)
+  CN=${CWAS##*#}
+  case "$CN" in ''|*[!0-9]*) CN=0 ;; esac
+  if [ -n "$CBROKE" ]; then
+    CN=$((CN + 1))
+    [ "$CN" = "2" ] && broke="$broke contract:$CBROKE"
+  else
+    [ "${CN:-0}" -ge 2 ] 2>/dev/null && fixed="$fixed live-contracts"
+    CN=0
+  fi
+  now_lines="${now_lines}__contract=${CBROKE:-pass}#${CN}
+"
+fi
+
 printf '%s' "$now_lines" > "$STATE" 2>/dev/null || true
 
 SENT=false
@@ -113,9 +136,9 @@ MSG=""
 [ -n "$MSG" ] && notify "stranger sweep on $(hostname): $MSG
 A documented install command that does not work is invisible to users — they cannot report what they could not run."
 
-printf '{"ok":%s,"checked":%d,"failing":%d,"broke":"%s","recovered":"%s","transition":%s,"notified":%s}\n' \
+printf '{"ok":%s,"checked":%d,"failing":%d,"broke":"%s","recovered":"%s","contracts":%s,"transition":%s,"notified":%s}\n' \
   "$([ "$failing" = "0" ] && echo true || echo false)" "$checked" "$failing" \
-  "${broke# }" "${fixed# }" \
+  "${broke# }" "${fixed# }" "${CONTRACT_OUT:-null}" \
   "$([ -n "$MSG" ] && echo true || echo false)" "$SENT"
 [ "$failing" = "0" ] || exit 1
 exit 0
