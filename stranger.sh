@@ -58,6 +58,22 @@ WORK=$(mktemp -d "/tmp/stranger-$NAME-XXXX")
 export HOME="$WORK/home"; mkdir -p "$HOME"
 cd "$WORK" || exit 1
 
+# THIS CHECKER IS NOT A USER.
+#
+# It downloads a binary into a fresh HOME and runs it several times, which to any
+# usage-telemetry implementation looks exactly like a new machine being installed
+# and used. grange recorded 15 "installs" — every one of them this script. The
+# headline metric, "how many machines ran this", was entirely manufactured by the
+# tool auditing it, and a daily sweep across 17 repos would have kept manufacturing
+# it forever.
+#
+# DO_NOT_TRACK is the cross-vendor convention and cli-telemetry-spec requires
+# honouring it before any network code runs. <TOOL>_TELEMETRY=0 covers the
+# tool-specific switch for spec-conforming tools.
+export DO_NOT_TRACK=1
+TELVAR=$(printf '%s' "$NAME" | tr '[:lower:]-' '[:upper:]_')_TELEMETRY
+export "$TELVAR=0"
+
 # ---- 0. what does the README tell a stranger to do, and what does it promise?
 #         Both are read from the repo, because the claim is half of every check
 #         below. Without it this is a download test, and download tests pass on
@@ -298,6 +314,81 @@ if [ "$RUNS" = "1" ]; then
   else
     skip "no help-json verb"
   fi
+  # ---- does it phone home, and does it stop when told to?
+  #
+  # Two different questions, and users deserve both answers. Whether a tool sends
+  # anything at all is a disclosure; whether it KEEPS sending after DO_NOT_TRACK=1
+  # is a defect — cli-telemetry-spec requires that switch to be honoured before
+  # any network code runs, and DO_NOT_TRACK is a cross-vendor convention that
+  # predates it.
+  #
+  # Measured with strace when available, because it needs no cooperation from the
+  # tool: a connect() to a non-loopback address is a connect() whatever the
+  # binary claims. Where strace is absent this is skipped rather than guessed —
+  # dk1, which runs the scheduled sweep, has no strace, and a check that silently
+  # degrades into "pass" is worse than one that says it did not run.
+  if command -v strace >/dev/null 2>&1; then
+    # One number, always. The first version chained greps with `||` and printed
+    # "0\n0\n0", which the arithmetic below then read as non-zero — reporting
+    # "it made 0 connections DESPITE DO_NOT_TRACK=1" about a tool that had made
+    # none.
+    conns() {
+      rm -f "$WORK/st.txt"
+      env "$@" strace -f -e trace=connect -o "$WORK/st.txt" ./bin "$PROBE_VERB" >/dev/null 2>&1
+      [ -f "$WORK/st.txt" ] || { echo 0; return; }
+      grep 'connect(' "$WORK/st.txt" 2>/dev/null \
+        | grep -v 'AF_UNIX\|AF_NETLINK\|127\.0\.0\.1\|ENOENT' \
+        | wc -l | tr -d ' '
+    }
+    # The probe verb must be one the tool ACTUALLY has and that completes
+    # normally. "version"/"help" were tried first and grange has neither — an
+    # unknown verb exits before any telemetry runs, so the probe measured a code
+    # path that could not phone home and concluded the tool never does.
+    PROBE_VERB=""
+    for cand in ${VERB:-} guide help-json version help; do
+      [ -n "$cand" ] || continue
+      if has_verb "$cand"; then PROBE_VERB="$cand"; break; fi
+    done
+    [ -n "$PROBE_VERB" ] || PROBE_VERB="help"
+
+    # OFF: the switch must be honoured. A fresh HOME each time, because the first
+    # run on a machine is exactly when a tool has most reason to announce itself.
+    HOME="$WORK/dnt"; mkdir -p "$HOME"
+    OFF=$(conns DO_NOT_TRACK=1 "$TELVAR=0")
+    HOME="$WORK/home"
+    if [ "${OFF:-0}" -eq 0 ] 2>/dev/null; then
+      check "no outbound connection with DO_NOT_TRACK=1 — the off switch is real" 1
+    else
+      check "it made $OFF outbound connection(s) DESPITE DO_NOT_TRACK=1" 0
+      notes="$notes ignores-do-not-track"
+    fi
+
+    # ON: informational. Phoning home is a choice; concealing it is the problem.
+    HOME="$WORK/on"; mkdir -p "$HOME"
+    # BOTH switches must be cleared: this script exports $TELVAR=0 for the whole
+    # sandbox, so clearing DO_NOT_TRACK alone left the tool-specific opt-out in
+    # force and the "on" probe was still off.
+    # Aimed at TEST-NET-1 (RFC 5737, unroutable by definition) so the probe can
+    # OBSERVE the connection attempt without delivering anything to a real
+    # collector — otherwise the check that exists to stop this script polluting
+    # someone's metrics would itself send an event on every audit.
+    #
+    # Only works for tools that honour <TOOL>_TELEMETRY_URL, which
+    # cli-telemetry-spec requires (§5.5). A tool with a hardcoded endpoint will
+    # receive one event per audit; that is a reason for the spec to require the
+    # override, not a reason to skip the check.
+    URLVAR="${TELVAR}_URL"
+    ON=$(conns DO_NOT_TRACK= "$TELVAR=" "$URLVAR=http://192.0.2.1/stranger-probe")
+    HOME="$WORK/home"
+    if [ "${ON:-0}" -gt 0 ] 2>/dev/null; then
+      echo "  info this tool contacts the network by default ($ON connection(s) on \`$NAME $PROBE_VERB\`) and stops when asked"
+    else
+      echo "  info this tool makes no outbound connection at all"
+    fi
+  else
+    skip "phone-home check (strace not installed — not guessing)"
+  fi
+
   # stdout discipline on whatever verb we can safely run
   V="${VERB:-version}"
   if OUT=$(./bin "$V" 2>/dev/null) && [ -n "$OUT" ]; then
